@@ -4,33 +4,35 @@ import time
 import google.generativeai as genai
 
 from ebooklib import epub
-from datetime import datetime, timedelta
+from datetime import datetime
+from log_type import LogType
 from config import API_KEY
 
 
 class Translator:
-    def __init__(self, save_path, target_lang: str="pl", max_chars: int = 6000):
+    def __init__(self, save_path, target_lang: str="pl"):
         self.target_lang = target_lang
         self.save_path = save_path
         if not os.path.exists(self.save_path):
             print(f"Creating directory: {self.save_path}")
             os.makedirs(self.save_path)
 
-        # max  chars per chunk
-        self.max_chars = max_chars
-
         # model configuration
         genai.configure(api_key=API_KEY)
         self.model = genai.GenerativeModel("gemini-2.0-flash")
-        #gemini-2.0-flash gemini-2.0-flash-lite
 
-        #  nax request and token per minute
+        #  model limit
+        self.max_input_tokens = 6_000 # input cant be bigger than output
+        self.__max_input_chars = self.max_input_tokens * 4  # 1 token ~ 4 chars
+        self.max_output_tokens = 8_000
         self.max_requests_per_minute = 15
+        self.max_requests_per_day = 500
         self.max_tokens_per_minute = 1_000_000
 
-        self.requests_sent = 0
-        self.tokens_sent = 0
-        self.current_window_start = datetime.now()
+        self.__requests_per_day_left = 500
+        self.__requests_sent = 0
+        self.__tokens_sent = 0
+        self.__current_window_start = datetime.now()
 
         self.logs_path = "./logs"
         if not os.path.exists(self.logs_path):
@@ -69,11 +71,12 @@ class Translator:
                 translated_html = ''.join(translated_chunks)
 
                 # writing logs
-                with open(f"{self.logs_path}/translation_logs", "a", encoding="utf-8") as f:
-                    f.write(f"\n{'*' * 40}\n")
-                    f.write(f"🔁 Translated {i + 1}/{total}: {item.file_name}\n")
-                    f.write(translated_html)
-                    f.write(f"\n{'*' * 40}\n")
+                self.__write_logs(LogType.NORMAL, f"🔁 Translated {i + 1}/{total}: {item.file_name}\n{translated_html}")
+                # with open(f"{self.logs_path}/translation_logs", "a", encoding="utf-8") as f:
+                #     f.write(f"\n{'*' * 40}\n")
+                #     f.write(f"🔁 Translated {i + 1}/{total}: {item.file_name}\n")
+                #     f.write(translated_html)
+                #     f.write(f"\n{'*' * 40}\n")
 
                 new_item = epub.EpubHtml(
                     uid=item.id,
@@ -104,7 +107,7 @@ class Translator:
         for token in tokens:
             if token is None:
                 continue
-            if len(current_chunk) + len(token) > self.max_chars:
+            if len(current_chunk) + len(token) > self.__max_input_chars:
                 chunks.append(current_chunk)
                 current_chunk = token
             else:
@@ -123,11 +126,9 @@ class Translator:
             f"{html_chunk}"
         )
 
-        # estimated tokens for response
-        estimated_response_tokens = 3000
         estimated_input_tokens = int(len(prompt) / 4)  # 1 token ~ 4 chars
 
-        self.__wait_if_needed(estimated_input_tokens + estimated_response_tokens)
+        self.__wait_if_needed(estimated_input_tokens + self.max_output_tokens) # our output can have max 8000 tokens, and we add this to our token limit per minute
 
         try:
             response = self.model.generate_content(prompt)
@@ -136,43 +137,62 @@ class Translator:
             else:
                 print("⚠️ Empty response from model.")
                 # writing logs
-                with open(f"{self.logs_path}/warning_logs", "a", encoding="utf-8") as f:
-                    f.write(f"\n{'*' * 40}\n")
-                    f.write(f"HTML chunk: {html_chunk}\n")
-                    f.write(f"Response: {response}\n")
-                    f.write(f"\n{'*' * 40}\n")
+                self.__write_logs(LogType.WARNING, f"HTML chunk: {html_chunk}\nResponse: {response}")
+                # with open(f"{self.logs_path}/warning_logs", "a", encoding="utf-8") as f:
+                #     f.write(f"\n{'*' * 40}\n")
+                #     f.write(f"HTML chunk: {html_chunk}\n")
+                #     f.write(f"Response: {response}")
+                #     f.write(f"\n{'*' * 40}\n")
                 return html_chunk
         except Exception as e:
             print(f"❌ Error during translation: {e}")
             # writing logs
-            with open(f"{self.logs_path}/error_logs", "a", encoding="utf-8") as f:
-                f.write(f"\n{'*' * 40}\n")
-                f.write(f"Error: {e}\n")
-                f.write(f"HTML chunk: {html_chunk}\n")
-                f.write(f"\n{'*' * 40}\n")
+            self.__write_logs(LogType.ERROR, f"Error: {e}\nHTML chunk: {html_chunk}")
+            # with open(f"{self.logs_path}/error_logs", "a", encoding="utf-8") as f:
+            #     f.write(f"\n{'*' * 40}\n")
+            #     f.write(f"Error: {e}\n")
+            #     f.write(f"HTML chunk: {html_chunk}")
+            #     f.write(f"\n{'*' * 40}\n")
             return html_chunk
 
     def __wait_if_needed(self, estimated_tokens: int):
         now = datetime.now()
-        elapsed = (now - self.current_window_start).total_seconds()
+        elapsed = (now - self.__current_window_start).total_seconds()
 
         if elapsed >= 60:
             # window reset
-            self.current_window_start = now
-            self.requests_sent = 0
-            self.tokens_sent = 0
+            self.__current_window_start = now
+            self.__requests_sent = 0
+            self.__tokens_sent = 0
 
         # out of request or tokens per minute -> wait
-        while (self.requests_sent >= self.max_requests_per_minute or
-               self.tokens_sent + estimated_tokens > self.max_tokens_per_minute):
+        while (self.__requests_sent >= self.max_requests_per_minute or
+               self.__tokens_sent + estimated_tokens > self.max_tokens_per_minute):
             wait_time = 60 - elapsed
             wait_time = max(wait_time, 1)
-            print(f"⏳ Rate limit hit. Waiting {int(wait_time)} seconds...")
+            print(f"⏳ Rate limit hit. Used {self.__requests_sent}/{self.max_requests_per_minute} request and {self.__tokens_sent}/{self.max_tokens_per_minute} tokens."
+                  f"Waiting {int(wait_time)} seconds...")
             time.sleep(wait_time)
-            self.current_window_start = datetime.now()
-            self.requests_sent = 0
-            self.tokens_sent = 0
+            self.__current_window_start = datetime.now()
+            self.__requests_sent = 0
+            self.__tokens_sent = 0
             elapsed = 0
 
-        self.requests_sent += 1
-        self.tokens_sent += estimated_tokens
+        self.__requests_per_day_left -= 1
+        self.__requests_sent += 1
+        self.__tokens_sent += estimated_tokens
+
+    def __write_logs(self, log_type: LogType, msg: str):
+        name = ""
+        match log_type:
+            case LogType.NORMAL:
+                name = "translation_logs"
+            case LogType.WARNING:
+                name = "warning_logs"
+            case LogType.ERROR:
+                name = "error_logs"
+
+        with open(f"{self.logs_path}/{name}", "a", encoding="utf-8") as f:
+            f.write(f"\n{'*' * 40}\n")
+            f.write(msg)
+            f.write(f"\n{'*' * 40}\n")
