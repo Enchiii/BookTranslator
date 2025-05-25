@@ -3,7 +3,7 @@ import os
 from translator import Translator
 from ebooklib import epub
 
-BOOKS_DIR = "./Books"
+BOOKS_DIR = "books"
 
 if __name__ == '__main__':
     target_lang = input("Enter target language: ")
