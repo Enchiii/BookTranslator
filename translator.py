@@ -8,6 +8,8 @@ from datetime import datetime
 from log_type import LogType
 from config import API_KEY
 
+from bs4 import BeautifulSoup
+
 
 class Translator:
     def __init__(self):
@@ -60,7 +62,7 @@ class Translator:
     def translate_book(self, path: str) -> epub.EpubBook:
         print("📖 Book translation started!")
         start_time = datetime.now()
-        book = epub.read_epub(path)
+        book = epub.read_epub(path, {"ignore_ncx": True})
         translated_book = epub.EpubBook()
 
         book_title = book.get_metadata('DC', 'title')[0][0]
@@ -101,18 +103,12 @@ class Translator:
 
                 # writing logs
                 self.__write_logs(LogType.NORMAL, msg)
-                # self.__write_logs(LogType.NORMAL, f"🔁 Translated {i + 1}/{total}: {item.file_name}\n{translated_html}")
-                # with open(f"{self.logs_path}/translation_logs", "a", encoding="utf-8") as f:
-                #     f.write(f"\n{'*' * 40}\n")
-                #     f.write(f"🔁 Translated {i + 1}/{total}: {item.file_name}\n")
-                #     f.write(translated_html)
-                #     f.write(f"\n{'*' * 40}\n")
 
                 new_item = epub.EpubHtml(
                     uid=item.id,
                     file_name=item.file_name,
                     media_type=item.media_type,
-                    content=translated_html
+                    content=translated_html.encode("utf-8")
                 )
                 translated_book.add_item(new_item)
             else:
@@ -122,12 +118,16 @@ class Translator:
         translated_book.spine = book.spine
         translated_book.toc = book.toc
 
-        # save book
-        output_path = f"{self.save_path}/{book_title}_{self.target_lang}.epub"
-        epub.write_epub(output_path, translated_book)
-
         print("✅ Book translation completed!")
-        print(f"📦 Book saved in: {output_path}")
+
+        # validate whole book before saving
+        print("🔍 Validating translated book structure...")
+        if self.__validate_book(translated_book):
+            output_path = f"{self.save_path}/{book_title}_{self.target_lang}.epub"
+            epub.write_epub(output_path, translated_book)
+            print(f"📦 Book saved in: {output_path}")
+        else:
+            print("❌ Book contains invalid HTML. Not saved.")
 
         end_time = datetime.now()
         duration = end_time - start_time
@@ -156,22 +156,27 @@ class Translator:
         return chunks
 
     def __translate_chunk(self, context_before: str, html_chunk: str, context_after: str) -> str:
-        # prompt = (
-        #     f"Translate the following HTML to {self.target_lang}.\n"
-        #     "Keep the HTML tags untouched and translate only the visible text.\n"
-        #     "Do NOT translate names of people, places, or fictional entities unless they have a well-known equivalent.\n"
-        #     "Preserve original structure and avoid adding/removing HTML tags:\n\n"
-        #     f"{html_chunk}"
-        # )
-
         prompt = (
-            f"Translate the following HTML fragment to {self.target_lang}.\n"
-            "Keep the HTML tags untouched and translate only the visible text.\n. "
-            f"Do not translate names of people, places, or fictional entities unless they have a well-known {self.target_lang} equivalent.\n"
-            "Use the context before and after the fragment to maintain coherence:\n\n"
-            f"Previous context: {context_before}\n\n"
-            f"Fragment to translate (translate only this part):\n{html_chunk}\n\n"
-            f"Next context: {context_after}"
+            f"Translate the following HTML fragment into {self.target_lang}.\n\n"
+
+            "🛑 Do NOT modify the HTML structure in any way:\n"
+            "- Do NOT add, remove, or change any HTML tags or attributes.\n"
+            "- Keep all HTML entities (e.g., &nbsp;, &amp;, &lt;) exactly as they are.\n"
+            "- Do NOT wrap your answer in code blocks (e.g., no triple backticks ```).\n"
+
+            "📝 Translate ONLY the human-visible **text content** between HTML tags.\n"
+            "- Leave all HTML tags and attributes untouched.\n"
+            "- If there is no translatable text in the fragment, return it unchanged.\n"
+
+            "🧠 Maintain context and consistency:\n"
+            f"- Use the previous and next context to guide your translation and ensure coherence.\n"
+            f"- Do NOT translate names of people, places, or fictional entities unless a well-known {self.target_lang} equivalent exists.\n\n"
+
+            f"Context before:\n{context_before}\n\n"
+            f"🔽 HTML fragment to translate (only translate the visible text):\n{html_chunk}\n\n"
+            f"Context after:\n{context_after}\n\n"
+
+            "✅ Final output: ONLY the translated HTML fragment with the original structure preserved. DO NOT include any explanation, markdown formatting, or comments."
         )
 
         estimated_input_tokens = int(len(prompt) / 4)  # 1 token ~ 4 chars
@@ -186,21 +191,11 @@ class Translator:
                 print("⚠️ Empty response from model.")
                 # writing logs
                 self.__write_logs(LogType.WARNING, f"HTML chunk: {html_chunk}\nResponse: {response}")
-                # with open(f"{self.logs_path}/warning_logs", "a", encoding="utf-8") as f:
-                #     f.write(f"\n{'*' * 40}\n")
-                #     f.write(f"HTML chunk: {html_chunk}\n")
-                #     f.write(f"Response: {response}")
-                #     f.write(f"\n{'*' * 40}\n")
                 return html_chunk
         except Exception as e:
             print(f"❌ Error during translation: {e}")
             # writing logs
             self.__write_logs(LogType.ERROR, f"Error: {e}\nHTML chunk: {html_chunk}")
-            # with open(f"{self.logs_path}/error_logs", "a", encoding="utf-8") as f:
-            #     f.write(f"\n{'*' * 40}\n")
-            #     f.write(f"Error: {e}\n")
-            #     f.write(f"HTML chunk: {html_chunk}")
-            #     f.write(f"\n{'*' * 40}\n")
             return html_chunk
 
     def __extract_last_sentence(self, html: str) -> str:
@@ -239,6 +234,20 @@ class Translator:
         self.__requests_left_per_day -= 1
         self.__requests_sent += 1
         self.__tokens_sent += estimated_tokens
+
+    def __validate_book(self, book: epub.EpubBook) -> bool:
+        valid = True
+        for i, item in enumerate(book.get_items()):
+            if item.get_type() == 9:  # HTML
+                html = item.get_content().decode("utf-8", errors="ignore")
+                try:
+                    soup = BeautifulSoup(html, "html.parser")
+                    if not soup or not soup.html:
+                        raise ValueError("HTML root missing")
+                except Exception as e:
+                    valid = False
+                    self.__write_logs(LogType.ERROR, f"❌ Invalid HTML in {item.file_name}: {e}")
+        return valid
 
     def __write_logs(self, log_type: LogType, msg: str):
         name = ""

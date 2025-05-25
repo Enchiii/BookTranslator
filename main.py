@@ -1,7 +1,7 @@
 import os
 
 from translator import Translator
-
+from ebooklib import epub
 
 BOOKS_DIR = "./Books"
 
@@ -11,5 +11,5 @@ if __name__ == '__main__':
     book_translator.set_target_lang(target_lang)
 
     all_books = os.listdir(BOOKS_DIR)
-    for book in all_books:
-        book_translator.translate_book(f"{BOOKS_DIR}/{book}")
+    for book_name in all_books:
+        book_translator.translate_book(f"{BOOKS_DIR}/{book_name}")
