@@ -1,15 +1,17 @@
 import os
 
-from translator import Translator
 from ebooklib import epub
+from translator import Translator
 
-BOOKS_DIR = "books"
 
 if __name__ == '__main__':
+    input_path = input("Enter path to EPUB file: ").strip()
+    while not os.path.isfile(input_path) or not input_path.endswith('.epub'):
+        print("❌ Invalid file. Please enter a valid .epub file.")
+        input_path = input("Enter path to EPUB file: ").strip()
+
     target_lang = input("Enter target language: ")
     book_translator = Translator()
     book_translator.set_target_lang(target_lang)
 
-    all_books = os.listdir(BOOKS_DIR)
-    for book_name in all_books:
-        book_translator.translate_book(f"{BOOKS_DIR}/{book_name}")
+    book_translator.translate_book(input_path)

@@ -1,5 +1,5 @@
-import re
 import os
+import sys
 import time
 import google.generativeai as genai
 
@@ -192,5 +192,8 @@ class Translator:
             elapsed = 0
 
         self.__requests_left_per_day -= 1
+        if self.__requests_left_per_day <= 0:
+            sys.exit("❌ Out of requests for today!")
+
         self.__requests_sent += 1
         self.__tokens_sent += estimated_tokens
