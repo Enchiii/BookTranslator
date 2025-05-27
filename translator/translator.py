@@ -13,7 +13,7 @@ from .utils import write_logs, validate_book, extract_first_sentence, extract_la
 class Translator:
     def __init__(self):
         self.target_lang = "polish"
-        self.save_path = "./translatedBooks"
+        self.save_path = "./translated_books"
         if not os.path.exists(self.save_path):
             print(f"Creating directory: {self.save_path}")
             os.makedirs(self.save_path)
@@ -22,15 +22,16 @@ class Translator:
         genai.configure(api_key=API_KEY)
         self.model = genai.GenerativeModel("gemini-2.0-flash")
 
+        self.translating_duration = 0
+
         #  model limit
-        self.max_input_tokens = 6_000 # input cant be bigger than output
+        self.max_input_tokens = 5_000 # input cant be bigger than output
         self.__max_input_chars = self.max_input_tokens * 4  # 1 token ~ 4 chars
-        self.max_output_tokens = 8_000
+        self.max_output_tokens = 7_000
         self.max_requests_per_minute = 15
         self.max_tokens_per_minute = 1_000_000
 
-        self.requests_per_day = 500
-        self.__requests_left_per_day = 500
+        self.total_requests_sent = 0
         self.__requests_sent = 0
         self.__tokens_sent = 0
         self.__current_window_start = datetime.now()
@@ -46,14 +47,17 @@ class Translator:
                 self.max_input_tokens = value
                 self.__max_input_chars = value * 4
             match key:
-                case "save_path": self.save_path = value
-                case "target_lang": self.target_lang = value
                 case "max_input_tokens": self.max_input_tokens = value; self.__max_input_chars = value * 4
                 case "max_output_tokens": self.max_output_tokens = value
                 case "max_requests_per_minute": self.max_requests_per_minute = value
                 case "max_tokens_per_minute": self.max_tokens_per_minute = value
-                case "requests_per_day": self.requests_per_day = value
                 case _: raise AttributeError(f"Unknown configuration key: {key}")
+
+    def set_api_key(self, api_key: str) -> None:
+        genai.configure(api_key=api_key)
+
+    def set_save_path(self, save_path: str) -> None:
+        self.save_path = save_path
 
     def set_target_lang(self, target_lang: str) -> None:
         self.target_lang = target_lang
@@ -141,10 +145,9 @@ class Translator:
             print("❌ Book contains invalid HTML. Not saved.")
 
         end_time = datetime.now()
-        duration = end_time - start_time
-        print(f"⏱️ Translation took {duration} (hh:mm:ss)")
-        print(
-            f"Total requests sent: {self.requests_per_day - self.__requests_left_per_day}. Requests left for today: {self.__requests_left_per_day}")
+        self.translating_duration = end_time - start_time
+        print(f"⏱️ Translation took {self.translating_duration} (hh:mm:ss)")
+        print(f"Total requests sent: {self.total_requests_sent}")
 
     def __translate_chunk(self, context_before: str, html_chunk: str, context_after: str) -> str:
         prompt = build_prompt(self.target_lang, context_before, html_chunk, context_after)
@@ -161,6 +164,13 @@ class Translator:
                 print("⚠️ Empty response from model.")
                 # writing logs
                 write_logs(self.logs_path, LogType.WARNING, f"HTML chunk: {html_chunk}\nResponse: {response}")
+
+                # wait some seconds and try one more time
+                time.sleep(15)
+                response = self.model.generate_content(prompt)
+                if hasattr(response, 'text') and response.text:
+                    return response.text
+
                 return html_chunk
         except Exception as e:
             print(f"❌ Error during translation: {e}")
@@ -191,9 +201,6 @@ class Translator:
             self.__tokens_sent = 0
             elapsed = 0
 
-        self.__requests_left_per_day -= 1
-        if self.__requests_left_per_day <= 0:
-            sys.exit("❌ Out of requests for today!")
-
+        self.total_requests_sent += 1
         self.__requests_sent += 1
         self.__tokens_sent += estimated_tokens

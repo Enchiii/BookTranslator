@@ -1,6 +1,6 @@
 import re
 from ebooklib import epub
-from log_type import LogType
+from .log_type import LogType
 from bs4 import BeautifulSoup
 
 
