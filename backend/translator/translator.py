@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import google.generativeai as genai
 
@@ -11,12 +10,11 @@ from .utils import write_logs, validate_book, extract_first_sentence, extract_la
 
 
 class Translator:
-    def __init__(self):
+    def __init__(self, logs: bool=False):
+        self.logs = logs
         self.target_lang = "polish"
         self.save_path = "./translated_books"
-        if not os.path.exists(self.save_path):
-            print(f"Creating directory: {self.save_path}")
-            os.makedirs(self.save_path)
+        self.save_name = ""
 
         # model configuration
         genai.configure(api_key=API_KEY)
@@ -25,9 +23,9 @@ class Translator:
         self.translating_duration = 0
 
         #  model limit
-        self.max_input_tokens = 5_000 # input cant be bigger than output
+        self.max_input_tokens = 4000 # input cant be bigger than output
         self.__max_input_chars = self.max_input_tokens * 4  # 1 token ~ 4 chars
-        self.max_output_tokens = 7_000
+        self.max_output_tokens = 6000
         self.max_requests_per_minute = 15
         self.max_tokens_per_minute = 1_000_000
 
@@ -36,16 +34,16 @@ class Translator:
         self.__tokens_sent = 0
         self.__current_window_start = datetime.now()
 
-        self.logs_path = "./logs"
-        if not os.path.exists(self.logs_path):
-            print(f"Creating directory: {self.logs_path}")
-            os.makedirs(self.logs_path)
+        self.progress = 0.0
+
+        if logs:
+            self.logs_path = "./logs"
+            if not os.path.exists(self.logs_path):
+                print(f"Creating directory: {self.logs_path}")
+                os.makedirs(self.logs_path)
 
     def config(self,  **kwargs)  -> None:
         for key, value in kwargs.items():
-            if key == "max_input_tokens":
-                self.max_input_tokens = value
-                self.__max_input_chars = value * 4
             match key:
                 case "max_input_tokens": self.max_input_tokens = value; self.__max_input_chars = value * 4
                 case "max_output_tokens": self.max_output_tokens = value
@@ -53,11 +51,25 @@ class Translator:
                 case "max_tokens_per_minute": self.max_tokens_per_minute = value
                 case _: raise AttributeError(f"Unknown configuration key: {key}")
 
-    def set_api_key(self, api_key: str) -> None:
+    @staticmethod
+    def set_api_key(api_key: str) -> None:
+        if api_key is None or api_key == "": return
         genai.configure(api_key=api_key)
 
     def set_save_path(self, save_path: str) -> None:
         self.save_path = save_path
+        if not os.path.exists(self.save_path):
+            print(f"Creating directory: {self.save_path}")
+            os.makedirs(self.save_path)
+
+    def set_save_name(self, save_name: str) -> None:
+        self.save_name = save_name
+
+    def set_logs_path(self, logs_path: str) -> None:
+        self.logs_path = logs_path
+        if not os.path.exists(self.logs_path):
+            print(f"Creating directory: {self.logs_path}")
+            os.makedirs(self.logs_path)
 
     def set_target_lang(self, target_lang: str) -> None:
         self.target_lang = target_lang
@@ -74,6 +86,7 @@ class Translator:
         for i, item in enumerate(book.get_items()):
             if item.get_type() == 9:
                 translated_item = self.__translate_item(item, i, total)
+                self.progress = round(i/total * 100, 2)
                 translated_book.add_item(translated_item)
             else:
                 translated_book.add_item(item)
@@ -84,6 +97,31 @@ class Translator:
         self.__save_book(book, translated_book, start_time)
 
         return translated_book
+
+    def translate_book_gen(self, path: str):
+        print("📖 Book translation started!")
+        start_time = datetime.now()
+        book = epub.read_epub(path, {"ignore_ncx": True})
+        translated_book = self.__create_book_metadata(book)
+
+        html_items = [x for x in book.get_items() if x.get_type() == 9]
+        total = len(html_items)
+
+        for i, item in enumerate(book.get_items()):
+            if item.get_type() == 9:
+                translated_item = self.__translate_item(item, i, total)
+                self.progress = round(i/total * 100, 2)
+                yield self.progress
+                translated_book.add_item(translated_item)
+            else:
+                translated_book.add_item(item)
+
+        translated_book.spine = book.spine
+        translated_book.toc = book.toc
+
+        self.__save_book(book, translated_book, start_time)
+
+        yield 1.0
 
     @staticmethod
     def __create_book_metadata(book: epub.EpubBook) -> epub.EpubBook:
@@ -100,7 +138,9 @@ class Translator:
         start = datetime.now()
         chunks = split_html_into_chunks(html, self.__max_input_chars)
         end = datetime.now()
-        write_logs(self.logs_path, LogType.TIME, f"🔁 Item {index + 1}/{total}: {item.file_name} split into chunks time: {end - start}\n")
+
+        if self.logs:
+            write_logs(self.logs_path, LogType.TIME, f"🔁 Item {index + 1}/{total}: {item.file_name} split into chunks time: {end - start}\n")
 
         translated_chunks = []
         msg = f"🔁 Translated {index + 1}/{total}: {item.file_name}\n"
@@ -113,7 +153,9 @@ class Translator:
             translated_chunk = self.__translate_chunk(context_before, chunk, context_after)
             end = datetime.now()
 
-            write_logs(self.logs_path, LogType.TIME, f"   ↳ Chunk {j + 1}/{len(chunks)} translating time: {end - start}\n")
+            if self.logs:
+                write_logs(self.logs_path, LogType.TIME, f"   ↳ Chunk {j + 1}/{len(chunks)} translating time: {end - start}\n")
+
             translated_chunks.append(translated_chunk)
 
             msg += (f"   ↳ Chunk {j + 1}/{len(chunks)}\n"
@@ -121,7 +163,8 @@ class Translator:
                     f"       Translated chunk: {translated_chunk}\n"
                     f"       Context after: {context_after}\n\n")
 
-        write_logs(self.logs_path, LogType.NORMAL, msg)
+        if self.logs:
+            write_logs(self.logs_path, LogType.NORMAL, msg)
 
         translated_html = ''.join(translated_chunks)
         return epub.EpubHtml(
@@ -136,7 +179,10 @@ class Translator:
         print("🔍 Validating translated book structure...")
 
         book_title = original.get_metadata('DC', 'title')[0][0]
-        output_path = f"{self.save_path}/{book_title}_{self.target_lang}.epub"
+        if self.save_name == "":
+            output_path = f"{self.save_path}/{book_title}_{self.target_lang}.epub"
+        else:
+            output_path = f"{self.save_path}/{self.save_name}.epub"
 
         if validate_book(translated):
             epub.write_epub(output_path, translated)
@@ -163,7 +209,8 @@ class Translator:
             else:
                 print("⚠️ Empty response from model.")
                 # writing logs
-                write_logs(self.logs_path, LogType.WARNING, f"HTML chunk: {html_chunk}\nResponse: {response}")
+                if self.logs:
+                    write_logs(self.logs_path, LogType.WARNING, f"HTML chunk: {html_chunk}\nResponse: {response}")
 
                 # wait some seconds and try one more time
                 time.sleep(15)
@@ -175,7 +222,8 @@ class Translator:
         except Exception as e:
             print(f"❌ Error during translation: {e}")
             # writing logs
-            write_logs(self.logs_path, LogType.ERROR, f"Error: {e}\nHTML chunk: {html_chunk}")
+            if self.logs:
+                write_logs(self.logs_path, LogType.ERROR, f"Error: {e}\nHTML chunk: {html_chunk}")
             return html_chunk
 
     def __wait_if_needed(self, estimated_tokens: int):

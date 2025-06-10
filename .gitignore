@@ -184,7 +184,13 @@ fabric.properties
 # idea folder, uncomment if you don't need it
 .idea/
 
-translator/config.py
+backend/translator/config.py
 logs/
 translatedBooks/
 books/
+backend/config.py
+backend/translated_books/
+backend/temp_uploads/
+backend/logs/
+
+**/__pycache__/
