@@ -96,8 +96,6 @@ python main.py
 
 ## 🛣️ Todo:
 - 🚀 Automated translated books clearing cache
-- 📂 Support for more file types: `.pdf`, `.txt`, `.docx`, `mobi` etc.
 - Option to download logs
 - Saving translating progress and continuing from this point
-- Download history
 
