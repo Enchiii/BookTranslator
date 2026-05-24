@@ -1,20 +1,22 @@
 import re
+
+from bs4 import BeautifulSoup, Comment
 from ebooklib import epub
+
 from .log_type import LogType
-from bs4 import BeautifulSoup
 
 
-def write_logs(path:  str, log_type: LogType, msg: str):
+def write_logs(path: str, log_type: LogType, msg: str):
     name = ""
     match log_type:
         case LogType.NORMAL:
-            name = "translation_logs"
+            name = "translation_logs.txt"
         case LogType.WARNING:
-            name = "warning_logs"
+            name = "warning_logs.txt"
         case LogType.ERROR:
-            name = "error_logs"
+            name = "error_logs.txt"
         case LogType.TIME:
-            name = "time_logs"
+            name = "time_logs.txt"
 
     with open(f"{path}/{name}", "a", encoding="utf-8") as f:
         f.write(f"\n{'*' * 40}\n")
@@ -24,71 +26,113 @@ def write_logs(path:  str, log_type: LogType, msg: str):
 
 def validate_book(book: epub.EpubBook, logs_path: str = "./logs") -> bool:
     valid = True
-    for i, item in enumerate(book.get_items()):
+    for _, item in enumerate(book.get_items()):
         if item.get_type() == 9:  # HTML
-            html = item.get_content().decode("utf-8", errors="ignore")
+            raw_content = item.get_content()
+            html = (
+                raw_content.decode("utf-8", errors="ignore")
+                if isinstance(raw_content, bytes)
+                else str(raw_content)
+            )
+
             try:
                 soup = BeautifulSoup(html, "html.parser")
                 if not soup or not soup.html:
                     raise ValueError("HTML root missing")
             except Exception as e:
                 valid = False
-                write_logs(logs_path, LogType.ERROR, f"❌ Invalid HTML in {item.file_name}: {e}")
+                write_logs(
+                    logs_path,
+                    LogType.ERROR,
+                    f"❌ Invalid HTML in {item.file_name}: {e}",
+                )
     return valid
 
 
-def extract_first_sentence(html: str) -> str:
-    text = re.sub(r'<[^>]+>', '', html)
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    return sentences[0] if sentences else ""
+def translate_html_soup(
+    html_content: str, translate_func, logs_path: str, logs: bool
+) -> str:
+    soup = BeautifulSoup(html_content, "html.parser")
 
+    # Przeszukujemy absolutnie WSZYSTKIE węzły tekstowe w dokumencie.
+    # Dzięki temu nie ominie nas żaden zapomniany tag <a> czy rzadki element struktury.
+    text_nodes = soup.find_all(text=True)
 
-def extract_last_sentence(html: str) -> str:
-    text = re.sub(r'<[^>]+>', '', html)
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    return sentences[-1] if sentences else ""
-
-
-def build_prompt(target_lang: str, context_before: str, html_chunk: str, context_after: str) -> str:
-    return (
-            f"Translate the following HTML fragment into {target_lang}.\n\n"
-
-            "🛑 Do NOT modify the HTML structure in any way:\n"
-            "- Do NOT add, remove, or change any HTML tags or attributes.\n"
-            "- Keep all HTML entities (e.g., &nbsp;, &amp;, &lt;) exactly as they are.\n"
-            "- Do NOT wrap your answer in code blocks (e.g., no triple backticks ```).\n"
-
-            "📝 Translate ONLY the human-visible **text content** between HTML tags.\n"
-            "- Leave all HTML tags and attributes untouched.\n"
-            "- If there is no translatable text in the fragment, return it unchanged.\n"
-
-            "🧠 Maintain context and consistency:\n"
-            f"- Use the previous and next context to guide your translation and ensure coherence.\n"
-            f"- Do NOT translate names of people, places, or fictional entities unless a well-known {target_lang} equivalent exists.\n\n"
-
-            f"Context before:\n{context_before}\n\n"
-            f"🔽 HTML fragment to translate (only translate the visible text):\n{html_chunk}\n\n"
-            f"Context after:\n{context_after}\n\n"
-
-            "✅ Final output: ONLY the translated HTML fragment with the original structure preserved. DO NOT include any explanation, markdown formatting, or comments."
-        )
-
-
-def split_html_into_chunks(html: str, max_input_chars: int) -> list[str]:
-    chunks = []
-    current_chunk = ""
-    tokens = re.split(r"(\s+|<[^>]+>)", html)
-
-    for token in tokens:
-        if token is None:
+    for node in text_nodes:
+        # Pomijamy komentarze HTML, skrypty JS oraz style CSS wewnątrz dokumentu
+        if isinstance(node, Comment) or node.parent.name in [
+            "script",
+            "style",
+            "head",
+            "title",
+            "meta",
+        ]:
             continue
-        if len(current_chunk) + len(token) > max_input_chars:
-            chunks.append(current_chunk)
-            current_chunk = token
-        else:
-            current_chunk += token
 
-    if current_chunk:
-        chunks.append(current_chunk)
+        text_content = str(node).strip()
 
-    return chunks
+        # Ignorujemy całkowicie puste fragmenty tekstu
+        if not text_content:
+            continue
+
+        # --- BLOKADA HALUCYNACJI "SAMOCHÓD" (Dla liczb i znaków) ---
+        # Jeśli tekst to tylko cyfry, rzymskie liczby (np. I, II, X, v) lub pojedyncze znaki,
+        # zostawiamy go w oryginale. Model NLLB na 95% zrobiłby tu halucynację.
+        if (
+            re.match(r"^\d+$", text_content)
+            or re.match(r"^[IVXLCDMivxlcdm]+$", text_content)
+            or len(text_content) < 2
+        ):
+            continue
+
+        try:
+            # Wykonujemy paczkowane, bezpieczne tłumaczenie fragmentu tekstu
+            translated_text = translate_func(text_content)
+
+            # --- UNIWERSALNA BLOKADA HALUCYNACJI DLA KAŻDEGO JĘZYKA ---
+            lower_trans = translated_text.lower()
+
+            # Sprawdzamy, czy w tłumaczeniu pojawił się niesławny kaprys modelu NLLB
+            if "samochód" in lower_trans or "auto" in lower_trans:
+                orig_len = len(text_content)
+                trans_len = len(translated_text)
+
+                # Jeśli tekst źródłowy był krótki, a tłumaczenie urosło ponad 2-krotnie,
+                # to matematyczny dowód na to, że model "wymyślił" słowo samochód z niczego.
+                if orig_len < 15 and trans_len > (orig_len * 2):
+                    if logs:
+                        from .log_type import LogType
+                        from .utils import write_logs
+
+                        write_logs(
+                            logs_path,
+                            LogType.WARNING,
+                            f"⚠️ Zablokowano wielojęzyczną halucynację: '{text_content}' -> '{translated_text}'",
+                        )
+                    continue  # Odrzucamy to tłumaczenie, zostawiając bezpieczny oryginał
+
+            # Jeśli wszystko jest w porządku, podmieniamy tekst w strukturze DOM książki
+            node.replace_with(translated_text)
+
+            if logs:
+                from .log_type import LogType
+                from .utils import write_logs
+
+                write_logs(
+                    logs_path,
+                    LogType.NORMAL,
+                    f"Original text: {text_content}\nTranslated: {translated_text}",
+                )
+
+        except Exception as e:
+            if logs:
+                from .log_type import LogType
+                from .utils import write_logs
+
+                write_logs(
+                    logs_path,
+                    LogType.ERROR,
+                    f"Error replacing HTML node: {e}\nText: {text_content}",
+                )
+
+    return str(soup)

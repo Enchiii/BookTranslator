@@ -1,39 +1,46 @@
 import os
-import time
-import google.generativeai as genai
-
-from ebooklib import epub
+import re
 from datetime import datetime
+from typing import Generator
+
+import torch
+from ebooklib import epub
+from transformers.models.auto.modeling_auto import AutoModelForSeq2SeqLM
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+
 from .log_type import LogType
-from .config import API_KEY
-from .utils import write_logs, validate_book, extract_first_sentence, extract_last_sentence, build_prompt, split_html_into_chunks
+from .utils import (
+    translate_html_soup,
+    validate_book,
+    write_logs,
+)
 
 
 class Translator:
-    def __init__(self, logs: bool=False):
+    def __init__(
+        self, logs: bool = True, model_name: str = "facebook/nllb-200-distilled-600M"
+    ):
+        """
+        Models: "facebook/nllb-200-3.3B", facebook/nllb-200-distilled-1.3B, facebook/nllb-200-distilled-600M
+        """
         self.logs = logs
-        self.target_lang = "polish"
         self.save_path = "./translated_books"
         self.save_name = ""
 
-        # model configuration
-        genai.configure(api_key=API_KEY)
-        self.model = genai.GenerativeModel("gemini-2.0-flash")
+        # NLLB requires FLORES-200 language codes
+        self.src_lang = "eng_Latn"
+        self.target_lang = "pol_Latn"
+
+        # Model configuration
+        print(f"🤖 Loading model {model_name}...")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"⚙️ Using device: {self.device.upper()}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self.device)
 
         self.translating_duration = 0
-
-        #  model limit
-        self.max_input_tokens = 4000 # input cant be bigger than output
-        self.__max_input_chars = self.max_input_tokens * 4  # 1 token ~ 4 chars
-        self.max_output_tokens = 6000
-        self.max_requests_per_minute = 15
-        self.max_tokens_per_minute = 1_000_000
-
-        self.total_requests_sent = 0
-        self.__requests_sent = 0
-        self.__tokens_sent = 0
-        self.__current_window_start = datetime.now()
-
+        self.max_tokens = 512  # Optimal context window for NLLB
         self.progress = 0.0
 
         if logs:
@@ -42,39 +49,35 @@ class Translator:
                 print(f"Creating directory: {self.logs_path}")
                 os.makedirs(self.logs_path)
 
-    def config(self,  **kwargs)  -> None:
+    def config(self, **kwargs) -> None:
+        """
+        Configuration method for all translator settings.
+        Supported keys: src_lang, target_lang, save_path, save_name, logs_path
+        """
         for key, value in kwargs.items():
             match key:
-                case "max_input_tokens": self.max_input_tokens = value; self.__max_input_chars = value * 4
-                case "max_output_tokens": self.max_output_tokens = value
-                case "max_requests_per_minute": self.max_requests_per_minute = value
-                case "max_tokens_per_minute": self.max_tokens_per_minute = value
-                case _: raise AttributeError(f"Unknown configuration key: {key}")
+                case "src_lang":
+                    self.src_lang = value
+                case "target_lang":
+                    self.target_lang = value
+                case "save_name":
+                    self.save_name = value
+                case "save_path":
+                    self.save_path = value
+                    self.__ensure_dir(self.save_path)
+                case "logs_path":
+                    self.logs_path = value
+                    self.__ensure_dir(self.logs_path)
+                case _:
+                    raise AttributeError(f"Unknown configuration key: {key}")
 
-    @staticmethod
-    def set_api_key(api_key: str) -> None:
-        if api_key is None or api_key == "": return
-        genai.configure(api_key=api_key)
+    def __ensure_dir(self, path: str) -> None:
+        """Helper to create directory if it doesn't exist."""
+        if not os.path.exists(path):
+            print(f"Creating directory: {path}")
+            os.makedirs(path, exist_ok=True)
 
-    def set_save_path(self, save_path: str) -> None:
-        self.save_path = save_path
-        if not os.path.exists(self.save_path):
-            print(f"Creating directory: {self.save_path}")
-            os.makedirs(self.save_path)
-
-    def set_save_name(self, save_name: str) -> None:
-        self.save_name = save_name
-
-    def set_logs_path(self, logs_path: str) -> None:
-        self.logs_path = logs_path
-        if not os.path.exists(self.logs_path):
-            print(f"Creating directory: {self.logs_path}")
-            os.makedirs(self.logs_path)
-
-    def set_target_lang(self, target_lang: str) -> None:
-        self.target_lang = target_lang
-
-    def translate_book(self, path: str) -> epub.EpubBook:
+    def translate_book_gen(self, path: str) -> Generator[float, None, None]:
         print("📖 Book translation started!")
         start_time = datetime.now()
         book = epub.read_epub(path, {"ignore_ncx": True})
@@ -86,31 +89,7 @@ class Translator:
         for i, item in enumerate(book.get_items()):
             if item.get_type() == 9:
                 translated_item = self.__translate_item(item, i, total)
-                self.progress = round(i/total * 100, 2)
-                translated_book.add_item(translated_item)
-            else:
-                translated_book.add_item(item)
-
-        translated_book.spine = book.spine
-        translated_book.toc = book.toc
-
-        self.__save_book(book, translated_book, start_time)
-
-        return translated_book
-
-    def translate_book_gen(self, path: str):
-        print("📖 Book translation started!")
-        start_time = datetime.now()
-        book = epub.read_epub(path, {"ignore_ncx": True})
-        translated_book = self.__create_book_metadata(book)
-
-        html_items = [x for x in book.get_items() if x.get_type() == 9]
-        total = len(html_items)
-
-        for i, item in enumerate(book.get_items()):
-            if item.get_type() == 9:
-                translated_item = self.__translate_item(item, i, total)
-                self.progress = round(i/total * 100, 2)
+                self.progress = round((i + 1) / total * 100, 2)
                 yield self.progress
                 translated_book.add_item(translated_item)
             else:
@@ -120,71 +99,64 @@ class Translator:
         translated_book.toc = book.toc
 
         self.__save_book(book, translated_book, start_time)
-
-        yield 1.0
+        yield 100.0
 
     @staticmethod
     def __create_book_metadata(book: epub.EpubBook) -> epub.EpubBook:
         translated_book = epub.EpubBook()
-        title = book.get_metadata('DC', 'title')[0][0]
+        title = book.get_metadata("DC", "title")[0][0]
         translated_book.set_title(title)
-        translated_book.set_identifier(book.get_metadata('DC', 'identifier')[0][0])
+        translated_book.set_identifier(book.get_metadata("DC", "identifier")[0][0])
         return translated_book
 
-    def __translate_item(self, item: epub.EpubHtml, index: int, total: int) -> epub.EpubHtml:
-        print(f"🔁 Translating {index + 1}/{total}: {item.file_name}")
-        html = item.get_content().decode('utf-8')
+    def __translate_item(
+        self, item: epub.EpubHtml, index: int, total: int
+    ) -> epub.EpubHtml:
+        print(f"🔁 Translating {index}/{total}: {item.file_name}")
+
+        raw_content = item.get_content()
+        html = (
+            raw_content.decode("utf-8", errors="ignore")
+            if isinstance(raw_content, bytes)
+            else str(raw_content)
+        )
 
         start = datetime.now()
-        chunks = split_html_into_chunks(html, self.__max_input_chars)
+        translated_html = translate_html_soup(
+            html_content=html,
+            translate_func=self.__translate_text,
+            logs_path=self.logs_path if self.logs else "",
+            logs=self.logs,
+        )
         end = datetime.now()
 
         if self.logs:
-            write_logs(self.logs_path, LogType.TIME, f"🔁 Item {index + 1}/{total}: {item.file_name} split into chunks time: {end - start}\n")
+            write_logs(
+                self.logs_path,
+                LogType.TIME,
+                f"🔁 Item {index}/{total}: {item.file_name} translation time: {end - start}\n",
+            )
 
-        translated_chunks = []
-        msg = f"🔁 Translated {index + 1}/{total}: {item.file_name}\n"
-
-        for j, chunk in enumerate(chunks):
-            print(f"   ↳ Chunk {j + 1}/{len(chunks)}")
-            context_before = extract_last_sentence(chunks[j - 1]) if j > 0 else ""
-            context_after = extract_first_sentence(chunks[j + 1]) if j < len(chunks) - 1 else ""
-            start = datetime.now()
-            translated_chunk = self.__translate_chunk(context_before, chunk, context_after)
-            end = datetime.now()
-
-            if self.logs:
-                write_logs(self.logs_path, LogType.TIME, f"   ↳ Chunk {j + 1}/{len(chunks)} translating time: {end - start}\n")
-
-            translated_chunks.append(translated_chunk)
-
-            msg += (f"   ↳ Chunk {j + 1}/{len(chunks)}\n"
-                    f"       Context before: {context_before}\n"
-                    f"       Translated chunk: {translated_chunk}\n"
-                    f"       Context after: {context_after}\n\n")
-
-        if self.logs:
-            write_logs(self.logs_path, LogType.NORMAL, msg)
-
-        translated_html = ''.join(translated_chunks)
         return epub.EpubHtml(
             uid=item.id,
             file_name=item.file_name,
             media_type=item.media_type,
-            content=translated_html.encode("utf-8")
+            content=translated_html.encode("utf-8"),
         )
 
-    def __save_book(self, original: epub.EpubBook, translated: epub.EpubBook, start_time: datetime):
+    def __save_book(
+        self, original: epub.EpubBook, translated: epub.EpubBook, start_time: datetime
+    ):
         print("✅ Book translation completed!")
         print("🔍 Validating translated book structure...")
 
-        book_title = original.get_metadata('DC', 'title')[0][0]
+        book_title = original.get_metadata("DC", "title")[0][0]
         if self.save_name == "":
             output_path = f"{self.save_path}/{book_title}_{self.target_lang}.epub"
         else:
             output_path = f"{self.save_path}/{self.save_name}.epub"
 
-        if validate_book(translated):
+        if validate_book(translated, self.logs_path if self.logs else "./logs"):
             epub.write_epub(output_path, translated)
             print(f"📦 Book saved in: {output_path}")
         else:
@@ -193,62 +165,86 @@ class Translator:
         end_time = datetime.now()
         self.translating_duration = end_time - start_time
         print(f"⏱️ Translation took {self.translating_duration} (hh:mm:ss)")
-        print(f"Total requests sent: {self.total_requests_sent}")
 
-    def __translate_chunk(self, context_before: str, html_chunk: str, context_after: str) -> str:
-        prompt = build_prompt(self.target_lang, context_before, html_chunk, context_after)
+    def __translate_text(self, text: str) -> str:
+        if not text.strip():
+            return text
 
-        estimated_input_tokens = int(len(prompt) / 4)  # 1 token ~ 4 chars
+        self.tokenizer.src_lang = self.src_lang
 
-        self.__wait_if_needed(estimated_input_tokens + self.max_output_tokens) # our output can have max 8000 tokens, and we add this to our token limit per minute
+        # Split text into sentences intelligently using regex (lookbehind for punctuation)
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+
+        translated_chunks = []
+        current_chunk = []
+        current_tokens_count = 0
+
+        # Safe NLLB context window calculation (512 total - 4 for mandatory system tokens)
+        max_safe_capacity = self.max_tokens - 4
+
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+
+            # Measure exactly how many tokens this sentence contains
+            sentence_tokens = len(
+                self.tokenizer.encode(sentence, add_special_tokens=False)
+            )
+
+            # Scenario A: Single sentence is an absolute behemoth that exceeds the full block size on its own
+            if sentence_tokens > max_safe_capacity:
+                if current_chunk:
+                    translated_chunks.append(
+                        self.__execute_model_generation(" ".join(current_chunk))
+                    )
+                    current_chunk = []
+                    current_tokens_count = 0
+
+                # Force chunking by words/sub-tokens for this extreme edge case
+                translated_chunks.append(self.__execute_model_generation(sentence))
+                continue
+
+            # Scenario B: Sentence overflows the current ongoing bucket pool
+            if current_tokens_count + sentence_tokens > max_safe_capacity:
+                translated_chunks.append(
+                    self.__execute_model_generation(" ".join(current_chunk))
+                )
+                current_chunk = [sentence]
+                current_tokens_count = sentence_tokens
+            else:
+                current_chunk.append(sentence)
+                current_tokens_count += sentence_tokens
+
+        # Process any remaining sentences trapped inside the buffer pipeline
+        if current_chunk:
+            translated_chunks.append(
+                self.__execute_model_generation(" ".join(current_chunk))
+            )
+
+        return " ".join(translated_chunks)
+
+    def __execute_model_generation(self, text_block: str) -> str:
+        """Executes raw pipeline compilation and inference via the GPU/CPU hardware."""
+        inputs = self.tokenizer(
+            text_block, return_tensors="pt", max_length=self.max_tokens, truncation=True
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         try:
-            response = self.model.generate_content(prompt)
-            if hasattr(response, 'text') and response.text:
-                return response.text
-            else:
-                print("⚠️ Empty response from model.")
-                # writing logs
-                if self.logs:
-                    write_logs(self.logs_path, LogType.WARNING, f"HTML chunk: {html_chunk}\nResponse: {response}")
-
-                # wait some seconds and try one more time
-                time.sleep(15)
-                response = self.model.generate_content(prompt)
-                if hasattr(response, 'text') and response.text:
-                    return response.text
-
-                return html_chunk
+            forced_bos_token_id = self.tokenizer.convert_tokens_to_ids(self.target_lang)
+            translated_tokens = self.model.generate(
+                **inputs,
+                forced_bos_token_id=forced_bos_token_id,
+                max_length=self.max_tokens,
+                num_beams=2,
+            )
+            return self.tokenizer.batch_decode(
+                translated_tokens, skip_special_tokens=True
+            )[0]
         except Exception as e:
-            print(f"❌ Error during translation: {e}")
-            # writing logs
+            print(f"❌ NLLB Translation Error: {e}")
             if self.logs:
-                write_logs(self.logs_path, LogType.ERROR, f"Error: {e}\nHTML chunk: {html_chunk}")
-            return html_chunk
-
-    def __wait_if_needed(self, estimated_tokens: int):
-        now = datetime.now()
-        elapsed = (now - self.__current_window_start).total_seconds()
-
-        if elapsed >= 60:
-            # window reset
-            self.__current_window_start = now
-            self.__requests_sent = 0
-            self.__tokens_sent = 0
-
-        # out of request or tokens per minute -> wait
-        while (self.__requests_sent >= self.max_requests_per_minute or
-               self.__tokens_sent + estimated_tokens > self.max_tokens_per_minute):
-            wait_time = 60 - elapsed
-            wait_time = max(wait_time, 1)
-            print(f"⏳ Rate limit hit. Used {self.__requests_sent}/{self.max_requests_per_minute} request and {self.__tokens_sent}/{self.max_tokens_per_minute} tokens."
-                  f"Waiting {int(wait_time)} seconds...")
-            time.sleep(wait_time)
-            self.__current_window_start = datetime.now()
-            self.__requests_sent = 0
-            self.__tokens_sent = 0
-            elapsed = 0
-
-        self.total_requests_sent += 1
-        self.__requests_sent += 1
-        self.__tokens_sent += estimated_tokens
+                write_logs(
+                    self.logs_path, LogType.ERROR, f"Error: {e}\nRaw Text: {text_block}"
+                )
+            return text_block
